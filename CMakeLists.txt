@@ -557,6 +557,24 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     set(FP4_ARCHS)
   endif()
 
+  # FP4 Archs and flags
+  cuda_archs_loose_intersection(FP4_ARCHS_SM120A "12.0a" "${CUDA_ARCHS}")
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND FP4_ARCHS_SM120A)
+    set(SRCS
+      "csrc/quantization/fp4/nvfp4_quant_kernels.cu"
+      "csrc/quantization/fp4/nvfp4_scaled_mm_kernels.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${SRCS}"
+      CUDA_ARCHS "${FP4_ARCHS_SM120A}")
+    list(APPEND VLLM_EXT_SRC "${SRCS}")
+    list(APPEND VLLM_GPU_FLAGS "-DENABLE_NVFP4_SM120A=1")
+    message(STATUS "Building NVFP4 for archs: ${FP4_ARCHS_SM120A}")
+  else()
+    message(STATUS "Not building NVFP4 as no compatible archs were found.")
+    # clear FP4_ARCHS_SM120A
+    set(FP4_ARCHS_SM120A)
+  endif()
+
   # CUTLASS MLA Archs and flags
   cuda_archs_loose_intersection(MLA_ARCHS "10.0a" "${CUDA_ARCHS}")
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND MLA_ARCHS)

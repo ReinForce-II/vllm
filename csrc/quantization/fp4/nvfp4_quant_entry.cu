@@ -16,7 +16,7 @@
 
 #include <torch/all.h>
 
-#if defined ENABLE_NVFP4 && ENABLE_NVFP4
+#if (defined ENABLE_NVFP4 && ENABLE_NVFP4) || (defined ENABLE_NVFP4_SM120A && ENABLE_NVFP4_SM120A)
 void scaled_fp4_quant_sm100a(torch::Tensor const& output,
                              torch::Tensor const& input,
                              torch::Tensor const& output_sf,
@@ -33,7 +33,7 @@ void scaled_fp4_experts_quant_sm100a(
 
 void scaled_fp4_quant(torch::Tensor& output, torch::Tensor const& input,
                       torch::Tensor& output_sf, torch::Tensor const& input_sf) {
-#if defined ENABLE_NVFP4 && ENABLE_NVFP4
+#if (defined ENABLE_NVFP4 && ENABLE_NVFP4) || (defined ENABLE_NVFP4_SM120A && ENABLE_NVFP4_SM120A)
   return scaled_fp4_quant_sm100a(output, input, output_sf, input_sf);
 #endif
   TORCH_CHECK_NOT_IMPLEMENTED(false, "No compiled nvfp4 quantization kernel");
