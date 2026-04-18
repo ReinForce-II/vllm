@@ -393,6 +393,10 @@ class FlashInferBackend(AttentionBackend):
         return [64, 128, 256]
 
     @classmethod
+    def supports_non_causal(cls) -> bool:
+        return True
+
+    @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         return capability >= DeviceCapability(7, 5) and capability <= DeviceCapability(
             12, 1
@@ -500,6 +504,8 @@ class FlashInferMetadata:
     num_decode_tokens: int
     num_prefills: int
     num_prefill_tokens: int
+
+    causal: bool
 
     prefill: FIPrefill | TRTLLMPrefill | None
     """
@@ -929,6 +935,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # Step 2: Initialize the output metadata
         # Leave prefill/decode/cascade_wrapper empty, to be populated
         # case by case depending on the batch contents and backend selection.
+        causal = common_attn_metadata.causal
+
         attn_metadata = FlashInferMetadata(
             num_actual_tokens=num_actual_tokens,
             slot_mapping=common_attn_metadata.slot_mapping,
@@ -937,6 +945,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
+            causal=causal,
             use_cascade=use_cascade,
             prefill=None,
             decode=None,
@@ -1036,7 +1045,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 num_kv_heads=self.num_kv_heads,
                 head_dim=self.head_dim,
                 page_size=self.page_size,
-                causal=True,
+                causal=causal,
                 sm_scale=self.sm_scale,
                 window_left=self.window_left,
                 logits_soft_cap=self.logits_soft_cap,
@@ -1121,7 +1130,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         num_kv_heads=self.num_kv_heads,
                         head_dim_qk=self.head_dim,
                         page_size=self.page_size,
-                        causal=True,
+                        causal=causal,
                         sm_scale=self.sm_scale,
                         window_left=self.window_left,
                         logits_soft_cap=self.logits_soft_cap,
@@ -1452,7 +1461,7 @@ class FlashInferImpl(AttentionImpl):
                         self.logits_soft_cap or 0.0
                     )
                     assert prefill_wrapper._sm_scale == self.scale
-                    assert prefill_wrapper._causal
+                    assert prefill_wrapper._causal == attn_metadata.causal
                     prefill_wrapper.run(
                         prefill_query,
                         kv_cache_permute,

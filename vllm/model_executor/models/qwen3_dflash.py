@@ -10,7 +10,7 @@ from transformers import Qwen3Config
 
 from vllm import _custom_ops as ops
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config, replace
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -34,6 +34,9 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.multimodal.inputs import NestedTensors
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec, get_kv_quant_mode
+from vllm.utils.torch_utils import get_dtype_size, kv_cache_dtype_str_to_dtype
 
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen3 import Qwen3ForCausalLM
@@ -45,6 +48,114 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+class DFlashDraftAttention(Attention):
+    """Draft attention that always runs on FlashAttention.
+
+    When the target model uses a KV cache dtype unsupported by FlashAttention
+    (for example fp8 in this environment), the draft falls back to model-dtype
+    KV storage and uses a draft-specific block size so its page size still
+    matches the target model's KV allocation.
+    """
+
+    _FLASH_ATTN_SUPPORTED_KV_DTYPES = {"auto", "float16", "bfloat16"}
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        scale: float,
+        cache_config: CacheConfig | None = None,
+        attn_type: str | None = None,
+        **kwargs,
+    ) -> None:
+        if attn_type is not None:
+            assert attn_type == AttentionType.DECODER, (
+                "DFlashDraftAttention only supports decoder attention"
+            )
+
+        original_cache_dtype = cache_config.cache_dtype if cache_config else "auto"
+        draft_cache_dtype = original_cache_dtype
+        draft_calculate_kv_scales = (
+            cache_config.calculate_kv_scales if cache_config else False
+        )
+
+        if draft_cache_dtype not in self._FLASH_ATTN_SUPPORTED_KV_DTYPES:
+            draft_cache_dtype = "auto"
+            draft_calculate_kv_scales = False
+
+        if cache_config is not None and (
+            draft_cache_dtype != cache_config.cache_dtype
+            or draft_calculate_kv_scales != cache_config.calculate_kv_scales
+        ):
+            cache_config = replace(
+                cache_config,
+                cache_dtype=draft_cache_dtype,
+                calculate_kv_scales=draft_calculate_kv_scales,
+            )
+
+        self._dflash_target_cache_dtype = original_cache_dtype
+        self._dflash_adjust_kv_spec = draft_cache_dtype != original_cache_dtype
+
+        super().__init__(
+            num_heads=num_heads,
+            head_size=head_size,
+            scale=scale,
+            cache_config=cache_config,
+            attn_backend=AttentionBackendEnum.FLASH_ATTN.get_class(),
+            attn_type=AttentionType.DECODER,
+            **kwargs,
+        )
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        if not self._dflash_adjust_kv_spec:
+            return super().get_kv_cache_spec(vllm_config)
+
+        target_block_size = vllm_config.cache_config.block_size
+        target_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
+            self._dflash_target_cache_dtype,
+            vllm_config.model_config,
+        )
+        target_spec = FullAttentionSpec(
+            block_size=target_block_size,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_size,
+            head_size_v=self.head_size_v,
+            dtype=target_cache_torch_dtype,
+            kv_quant_mode=get_kv_quant_mode(self._dflash_target_cache_dtype),
+        )
+        target_page_size = target_spec.page_size_bytes
+        if vllm_config.cache_config.mamba_page_size_padded is not None:
+            target_page_size = max(
+                target_page_size,
+                vllm_config.cache_config.mamba_page_size_padded,
+            )
+
+        draft_token_page_size = (
+            self.num_kv_heads
+            * (self.head_size + self.head_size_v)
+            * get_dtype_size(self.kv_cache_torch_dtype)
+        )
+        if draft_token_page_size > target_page_size:
+            raise ValueError(
+                "DFlash draft FlashAttention KV cache cannot be aligned with the "
+                "target KV cache page size."
+            )
+        if target_page_size % draft_token_page_size != 0:
+            raise ValueError(
+                "DFlash draft FlashAttention KV cache requires an integral block "
+                "size to match the target KV cache page size."
+            )
+
+        return FullAttentionSpec(
+            block_size=target_page_size // draft_token_page_size,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_size,
+            head_size_v=self.head_size_v,
+            dtype=self.kv_cache_torch_dtype,
+            kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+        )
 
 
 class DFlashQwen3Attention(nn.Module):
@@ -109,7 +220,7 @@ class DFlashQwen3Attention(nn.Module):
             max_position=max_position,
             rope_parameters=rope_parameters,
         )
-        self.attn = Attention(
+        self.attn = DFlashDraftAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
@@ -243,12 +354,14 @@ class DFlashQwen3Model(nn.Module):
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
 
+        cache_config = current_vllm_config.cache_config
         self.layers = nn.ModuleList(
             [
                 DFlashQwen3DecoderLayer(
                     current_vllm_config,
                     prefix=maybe_prefix(prefix, f"layers.{layer_idx + start_layer_id}"),
                     config=self.config,
+                    cache_config=cache_config,
                 )
                 for layer_idx in range(self.config.num_hidden_layers)
             ]
@@ -585,6 +698,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         needs_squeeze = hidden_states.dim() == 1
         if needs_squeeze:
             hidden_states = hidden_states.unsqueeze(0)
+        hidden_states = hidden_states.to(self.model.fc.weight.dtype)
         result = self.model.fc(hidden_states)
         if needs_squeeze:
             result = result.squeeze(0)
