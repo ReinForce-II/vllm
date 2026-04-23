@@ -2293,7 +2293,11 @@ class GPUModelRunner(
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
-            if self.speculative_config and spec_decode_common_attn_metadata is None:
+            if (
+                hasattr(self, "drafter")
+                and self.speculative_config
+                and spec_decode_common_attn_metadata is None
+            ):
                 if isinstance(self.drafter, (EagleProposer, DFlashProposer)):
                     if self.drafter.kv_cache_gid == kv_cache_gid:
                         spec_decode_common_attn_metadata = cm
@@ -5522,7 +5526,7 @@ class GPUModelRunner(
             else:
                 hidden_states = outputs
 
-            if self.speculative_config and (
+            if get_pp_group().is_last_rank and self.speculative_config and (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
                 or self.speculative_config.uses_extract_hidden_states()
@@ -5586,6 +5590,11 @@ class GPUModelRunner(
         # ranks execute the rearrangement in synchronization.
         if not skip_eplb:
             self.eplb_step(is_dummy=True, is_profile=is_profile)
+
+        if not get_pp_group().is_last_rank:
+            assert isinstance(hidden_states, IntermediateTensors)
+            stage_hidden_states = hidden_states["hidden_states"]
+            return stage_hidden_states, stage_hidden_states[:0]
 
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
         logit_indices_device = torch.from_numpy(logit_indices).to(
@@ -6294,7 +6303,7 @@ class GPUModelRunner(
         self.calculate_reorder_batch_threshold()
 
         # Initialize drafter attention backend
-        if self.speculative_config and (
+        if hasattr(self, "drafter") and self.speculative_config and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_draft_model()
         ):
@@ -6346,7 +6355,7 @@ class GPUModelRunner(
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.
-        if self.speculative_config and (
+        if hasattr(self, "drafter") and self.speculative_config and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_extract_hidden_states()
         ):
@@ -6782,7 +6791,8 @@ class GPUModelRunner(
         )
 
         if (
-            self.speculative_config
+            hasattr(self, "drafter")
+            and self.speculative_config
             and self.speculative_config.uses_extract_hidden_states()
         ):
             assert isinstance(self.drafter, ExtractHiddenStatesProposer)
